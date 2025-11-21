@@ -5,7 +5,7 @@ Each Pydantic model represents a MongoDB collection.
 Collection name is the lowercase of the class name (e.g., Trip -> "trip").
 """
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, EmailStr
 from typing import Optional, List
 from datetime import date
 
@@ -56,4 +56,21 @@ class FeedPost(BaseModel):
     tags: List[str] = Field(default_factory=list)
     likes: int = Field(0, ge=0)
 
-# Note: Additional schemas like ChatRoom/Message can be added later as we expand chat features.
+# -------------------------
+# Auth Schemas
+# -------------------------
+
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserPublic(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    avatar_url: Optional[HttpUrl] = None

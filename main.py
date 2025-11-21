@@ -1,13 +1,15 @@
 import os
-from datetime import datetime
-from typing import Any, List
+import hashlib
+import secrets
+from datetime import datetime, timedelta
+from typing import Any, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from database import db, create_document, get_documents
-from schemas import Trip, Application, Guide, Review, FeedPost
+from schemas import Trip, Application, Guide, Review, FeedPost, UserCreate, UserLogin, UserPublic
 
 app = FastAPI(title="Community Travel Platform API")
 
@@ -39,6 +41,14 @@ def serialize_doc(doc: dict) -> dict:
 
 def serialize_list(docs: List[dict]) -> List[dict]:
     return [serialize_doc(d) for d in docs]
+
+
+def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
+    import hashlib as _hashlib
+    import secrets as _secrets
+    salt = salt or _secrets.token_hex(16)
+    hashed = _hashlib.sha256((salt + password).encode()).hexdigest()
+    return hashed, salt
 
 
 # -------------------------
@@ -80,6 +90,100 @@ def test_database():
 
 
 # -------------------------
+# Auth
+# -------------------------
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserPublic
+
+
+@app.post("/auth/register", response_model=AuthResponse)
+def register(payload: UserCreate):
+    try:
+        existing = db["user"].find_one({"email": payload.email})
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        hashed, salt = hash_password(payload.password)
+        user_doc = {
+            "name": payload.name,
+            "email": str(payload.email),
+            "password_hash": hashed,
+            "password_salt": salt,
+            "avatar_url": None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        user_id = db["user"].insert_one(user_doc).inserted_id
+        token = secrets.token_urlsafe(32)
+        session_doc = {
+            "user_id": str(user_id),
+            "token": token,
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(days=7),
+        }
+        db["session"].insert_one(session_doc)
+        user_public = UserPublic(id=str(user_id), name=user_doc["name"], email=user_doc["email"], avatar_url=None)
+        return {"token": token, "user": user_public}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(payload: UserLogin):
+    try:
+        user = db["user"].find_one({"email": str(payload.email)})
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        hashed, _ = hash_password(payload.password, user.get("password_salt"))
+        if hashed != user.get("password_hash"):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token = secrets.token_urlsafe(32)
+        session_doc = {
+            "user_id": str(user["_id"]),
+            "token": token,
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(days=7),
+        }
+        db["session"].insert_one(session_doc)
+        user_public = UserPublic(id=str(user["_id"]), name=user.get("name"), email=user.get("email"), avatar_url=user.get("avatar_url"))
+        return {"token": token, "user": user_public}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    try:
+        scheme, token = authorization.split(" ", 1)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    if scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid auth scheme")
+    session = db["session"].find_one({"token": token})
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    from bson import ObjectId
+    try:
+        user = db["user"].find_one({"_id": ObjectId(session.get("user_id"))})
+    except Exception:
+        user = None
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found for token")
+    return user
+
+
+@app.get("/auth/me", response_model=UserPublic)
+def me(user: dict = Depends(get_current_user)):
+    return UserPublic(id=str(user["_id"]), name=user.get("name"), email=user.get("email"), avatar_url=user.get("avatar_url"))
+
+
+# -------------------------
 # Trips
 # -------------------------
 
@@ -107,7 +211,6 @@ def list_trips(tag: str | None = None):
 @app.post("/api/trips/{trip_id}/apply")
 def apply_to_trip(trip_id: str, application: Application):
     try:
-        # Ensure trip_id ties with body
         data = application.model_dump()
         data["trip_id"] = trip_id
         app_id = create_document("application", data)
@@ -181,7 +284,6 @@ def list_feed(tag: str | None = None):
         if tag:
             filter_dict["tags"] = {"$in": [tag]}
         docs = get_documents("feedpost", filter_dict, limit=50)
-        # Sort newest first by created_at if present
         docs.sort(key=lambda d: d.get("created_at", datetime.min), reverse=True)
         return serialize_list(docs)
     except Exception as e:
